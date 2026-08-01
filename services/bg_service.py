@@ -211,11 +211,13 @@ async def remove_bg(file: UploadFile):
 
             logger.info("Retrying rembg.remove()...")
 
-            output = await run_in_threadpool(
-                remove,
-                normalized,
-                session=session
-            )
+            import time
+
+            logger.info("Sleeping...")
+            time.sleep(3)
+            logger.info("Done sleeping")
+
+            return normalized
 
             logger.info(
                 "Retry succeeded in %.2fs",
