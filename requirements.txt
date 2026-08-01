@@ -40,5 +40,5 @@ tqdm==4.68.2
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.7.0
-a2wsgi==1.10.10
+ a2wsgi==0.15.0
 uvicorn==0.49.0
