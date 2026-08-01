@@ -1,0 +1,9 @@
+fastapi[standard]==0.128.8
+uvicorn==0.39.0
+rembg==2.0.61
+onnxruntime==1.19.2
+pillow==12.2.0
+python-multipart==0.0.32
+pydantic==2.13.4
+typing_extensions==4.15.0
+requests==2.34.2
