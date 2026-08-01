@@ -136,7 +136,10 @@ async def read_upload_bytes(file: UploadFile, max_size: int) -> bytes:
 
 async def remove_bg(file: UploadFile):
 
+    logger.info("POST /bg-remove started")
+
     content_type = file.content_type.lower() if file.content_type else None
+    logger.info(f"Content-Type: {content_type}")
 
     if content_type not in ALLOWED_TYPES:
         if content_type and content_type != "application/octet-stream":
@@ -145,7 +148,10 @@ async def remove_bg(file: UploadFile):
                 detail="Only PNG, JPEG and WEBP images are supported."
             )
 
+    logger.info("Reading uploaded file...")
     image = await read_upload_bytes(file, MAX_FILE_SIZE)
+
+    logger.info(f"Upload size: {len(image)} bytes")
 
     if not image:
         raise HTTPException(
@@ -154,7 +160,9 @@ async def remove_bg(file: UploadFile):
         )
 
     try:
+        logger.info("Preprocessing image...")
         normalized = preprocess_image(image)
+        logger.info(f"Preprocessed size: {len(normalized)} bytes")
 
     except HTTPException:
         raise
@@ -167,6 +175,64 @@ async def remove_bg(file: UploadFile):
             detail="Unable to process image."
         )
 
+    start = time.perf_counter()
+
+    async with semaphore:
+
+        try:
+            logger.info("Getting ONNX session...")
+            current_session = await get_session()
+
+            logger.info("Calling rembg.remove()...")
+
+            output = await run_in_threadpool(
+                remove,
+                normalized,
+                session=current_session
+            )
+
+            logger.info(
+                "Background removal completed in %.2fs",
+                time.perf_counter() - start
+            )
+
+            gc.collect()
+
+            return output
+
+        except Exception:
+            logger.exception(
+                "Background removal failed. Retrying with a new session..."
+            )
+
+        try:
+            logger.info("Recreating ONNX session...")
+            await recreate_session()
+
+            logger.info("Retrying rembg.remove()...")
+
+            output = await run_in_threadpool(
+                remove,
+                normalized,
+                session=session
+            )
+
+            logger.info(
+                "Retry succeeded in %.2fs",
+                time.perf_counter() - start
+            )
+
+            gc.collect()
+
+            return output
+
+        except Exception:
+            logger.exception("Retry also failed.")
+
+            raise HTTPException(
+                status_code=500,
+                detail="Background removal failed."
+            )
     start = time.perf_counter()
 
     async with semaphore:

@@ -1,27 +1,22 @@
 from fastapi import APIRouter, UploadFile, File
 from fastapi.responses import Response
-
+import logging
 from services.bg_service import remove_bg
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-
-@router.post(
-    "/bg-remove",
-    response_class=Response,
-    responses={
-        200: {"content": {"image/png": {}}},
-        400: {"description": "Invalid image or request."},
-        413: {"description": "Uploaded image is too large."},
-        500: {"description": "Internal background removal error."},
-    },
-)
-async def bg_remove(file: UploadFile = File(..., description="PNG, JPEG or WEBP image for background removal")):
+@router.post("/bg-remove")
+async def bg_remove(file: UploadFile = File(...)):
+    logger.info("POST /bg-remove received")
 
     output = await remove_bg(file)
 
+    logger.info("Background removed successfully")
+
     return Response(
         content=output,
-        media_type="image/png",
-        headers={"Cache-Control": "no-store"},
+        media_type="image/png"
     )
+
+ 
