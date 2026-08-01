@@ -4,6 +4,7 @@ import gc
 import time
 import asyncio
 import logging
+from typing import Optional
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 from fastapi import HTTPException, UploadFile
@@ -16,16 +17,24 @@ logger = logging.getLogger(__name__)
 # Configuration
 # -----------------------------
 
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
+def _parse_positive_int(value: Optional[str], default: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+        return parsed if parsed > 0 else default
+    except ValueError:
+        return default
+
+MAX_CONCURRENT = _parse_positive_int(os.getenv("MAX_CONCURRENT"), 2)
 
 ALLOWED_TYPES = {
     "image/png",
     "image/jpeg",
+    "image/jpg",
     "image/webp",
 }
 
-MAX_FILE_SIZE = 5 * 1024 * 1024
-MAX_DIMENSION = 2048
+MAX_FILE_SIZE = _parse_positive_int(os.getenv("MAX_FILE_SIZE"), 5 * 1024 * 1024)
+MAX_DIMENSION = _parse_positive_int(os.getenv("MAX_DIMENSION"), 2048)
 
 # -----------------------------
 # Global objects
@@ -81,7 +90,9 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 
     img = ImageOps.exif_transpose(img)
 
-    if img.mode != "RGB":
+    if img.mode in {"RGBA", "LA"} or (img.mode == "P" and "transparency" in img.info):
+        img = img.convert("RGBA")
+    elif img.mode != "RGB":
         img = img.convert("RGB")
 
     img.thumbnail(
@@ -104,26 +115,42 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 # -----------------------------
 
 
+async def read_upload_bytes(file: UploadFile, max_size: int) -> bytes:
+    output = io.BytesIO()
+    chunk_size = 64 * 1024
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+
+        output.write(chunk)
+        if output.tell() > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Maximum upload size is {max_size / (1024 * 1024):.1f} MB."
+            )
+
+    return output.getvalue()
+
+
 async def remove_bg(file: UploadFile):
 
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PNG, JPEG and WEBP images are supported."
-        )
+    content_type = file.content_type.lower() if file.content_type else None
 
-    image = await file.read()
+    if content_type not in ALLOWED_TYPES:
+        if content_type and content_type != "application/octet-stream":
+            raise HTTPException(
+                status_code=400,
+                detail="Only PNG, JPEG and WEBP images are supported."
+            )
+
+    image = await read_upload_bytes(file, MAX_FILE_SIZE)
 
     if not image:
         raise HTTPException(
             status_code=400,
             detail="Empty image."
-        )
-
-    if len(image) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="Maximum upload size is 5 MB."
         )
 
     try:
