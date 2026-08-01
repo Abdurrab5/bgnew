@@ -1,5 +1,12 @@
 import os
 import logging
+import asyncio
+
+# Project directory and model cache path
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.environ.setdefault("U2NET_HOME", MODELS_DIR)
 
 # Limit CPU threads used by BLAS/OpenMP
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -32,6 +39,16 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+@app.on_event("startup")
+async def preload_model():
+    from services.bg_service import get_session
+
+    try:
+        asyncio.create_task(get_session())
+    except Exception:
+        logging.exception("Failed to create background model preload task")
 
 
 @app.get("/")
