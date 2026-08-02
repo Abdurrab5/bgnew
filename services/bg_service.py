@@ -1,31 +1,44 @@
-import os
-import io
-import gc
-import time
 import asyncio
+import gc
+import io
 import logging
+import os
+import time
 from typing import Optional
 
-from PIL import Image, ImageOps, UnidentifiedImageError
 from fastapi import HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from rembg import remove, new_session
+from PIL import Image, ImageOps, UnidentifiedImageError
+from rembg import new_session, remove
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------
+# ==========================================================
 # Configuration
-# -----------------------------
+# ==========================================================
 
-def _parse_positive_int(value: Optional[str], default: int) -> int:
+def positive_int(value: Optional[str], default: int) -> int:
     try:
-        parsed = int(value) if value is not None else default
-        return parsed if parsed > 0 else default
-    except ValueError:
+        value = int(value)
+        return value if value > 0 else default
+    except Exception:
         return default
 
-# Conservative defaults for a free cloud tier
-MAX_CONCURRENT = _parse_positive_int(os.getenv("MAX_CONCURRENT"), 1)
+
+MAX_CONCURRENT = positive_int(
+    os.getenv("MAX_CONCURRENT"),
+    1,
+)
+
+MAX_FILE_SIZE = positive_int(
+    os.getenv("MAX_FILE_SIZE"),
+    5 * 1024 * 1024,
+)
+
+MAX_DIMENSION = positive_int(
+    os.getenv("MAX_DIMENSION"),
+    1024,
+)
 
 ALLOWED_TYPES = {
     "image/png",
@@ -34,21 +47,24 @@ ALLOWED_TYPES = {
     "image/webp",
 }
 
-MAX_FILE_SIZE = _parse_positive_int(os.getenv("MAX_FILE_SIZE"), 5 * 1024 * 1024)
-# Reduce default processing dimension to lower memory and CPU on free tiers
-MAX_DIMENSION = _parse_positive_int(os.getenv("MAX_DIMENSION"), 1024)
+logger.info(
+    "Configuration: file=%d dimension=%d concurrent=%d",
+    MAX_FILE_SIZE,
+    MAX_DIMENSION,
+    MAX_CONCURRENT,
+)
 
-# -----------------------------
-# Global objects
-# -----------------------------
+# ==========================================================
+# Globals
+# ==========================================================
 
 session = None
 session_lock = asyncio.Lock()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-# -----------------------------
-# Session Management
-# -----------------------------
+# ==========================================================
+# Session
+# ==========================================================
 
 
 async def get_session():
@@ -56,9 +72,15 @@ async def get_session():
 
     if session is None:
         async with session_lock:
+
             if session is None:
                 logger.info("Loading U2Net model...")
-                session = await run_in_threadpool(new_session, "u2netp")
+
+                session = await run_in_threadpool(
+                    new_session,
+                    "u2netp",
+                )
+
                 logger.info("Model loaded.")
 
     return session
@@ -68,15 +90,19 @@ async def recreate_session():
     global session
 
     async with session_lock:
+
         logger.warning("Recreating ONNX session...")
 
-        session = await run_in_threadpool(new_session, "u2netp")
+        session = await run_in_threadpool(
+            new_session,
+            "u2netp",
+        )
 
-        logger.info("New ONNX session created.")
+        logger.info("New session ready.")
 
-# -----------------------------
-# Image Preprocessing
-# -----------------------------
+# ==========================================================
+# Image preprocessing
+# ==========================================================
 
 
 def preprocess_image(image_bytes: bytes) -> bytes:
@@ -85,140 +111,204 @@ def preprocess_image(image_bytes: bytes) -> bytes:
         img = Image.open(io.BytesIO(image_bytes))
 
     except UnidentifiedImageError:
+
         raise HTTPException(
             status_code=400,
-            detail="Invalid image."
+            detail="Invalid image.",
         )
 
     img = ImageOps.exif_transpose(img)
 
-    # Keep alpha if present; otherwise use RGB
-    if img.mode in {"RGBA", "LA"} or (img.mode == "P" and "transparency" in img.info):
+    if img.mode in ("RGBA", "LA") or (
+        img.mode == "P"
+        and "transparency" in img.info
+    ):
         img = img.convert("RGBA")
+
     elif img.mode != "RGB":
         img = img.convert("RGB")
 
-    # Resize to a conservative maximum to reduce memory & CPU usage on free tiers
     img.thumbnail(
         (MAX_DIMENSION, MAX_DIMENSION),
-        Image.Resampling.LANCZOS
+        Image.Resampling.LANCZOS,
     )
 
     output = io.BytesIO()
 
-    # Try to reduce output size while preserving quality. Use PNG for alpha, otherwise save optimized JPEG
-    if img.mode == "RGBA":
-        img.save(output, format="PNG", optimize=True)
-    else:
-        # JPEG saves are much smaller; use quality 85 for good balance
-        img.save(output, format="JPEG", quality=85, optimize=True)
+    img.save(
+        output,
+        format="PNG",
+        optimize=True,
+    )
 
     return output.getvalue()
 
-# -----------------------------
-# Background Removal
-# -----------------------------
+# ==========================================================
+# Upload reader
+# ==========================================================
 
 
-async def read_upload_bytes(file: UploadFile, max_size: int) -> bytes:
-    output = io.BytesIO()
-    chunk_size = 64 * 1024
+async def read_upload(file: UploadFile) -> bytes:
 
-    logger.info("Reading uploaded file in chunks (chunk_size=%d)", chunk_size)
+    buffer = io.BytesIO()
 
     while True:
-        chunk = await file.read(chunk_size)
+
+        chunk = await file.read(65536)
+
         if not chunk:
             break
 
-        output.write(chunk)
-        if output.tell() > max_size:
-            logger.warning("Upload exceeded max size: %d bytes", output.tell())
+        buffer.write(chunk)
+
+        if buffer.tell() > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail=f"Maximum upload size is {max_size / (1024 * 1024):.1f} MB."
+                detail="Image is too large.",
             )
 
-    return output.getvalue()
+    return buffer.getvalue()
+
+# ==========================================================
+# Background removal
+# ==========================================================
 
 
 async def remove_bg(file: UploadFile):
-    """Read an UploadFile, preprocess it and remove the background.
 
-    Returns PNG bytes on success. Raises HTTPException with appropriate status
-    codes and logs full stack traces for debugging.
-    """
+    started = time.perf_counter()
 
-    filename = getattr(file, "filename", "<unknown>")
-    content_type = file.content_type.lower() if file.content_type else None
+    filename = file.filename or "unknown"
 
-    logger.info("POST /bg-remove received: filename=%s, content_type=%s", filename, content_type)
+    logger.info(
+        "Request started filename=%s type=%s",
+        filename,
+        file.content_type,
+    )
 
-    if content_type not in ALLOWED_TYPES:
-        if content_type and content_type != "application/octet-stream":
-            logger.warning("Unsupported content type: %s", content_type)
-            raise HTTPException(
-                status_code=400,
-                detail="Only PNG, JPEG and WEBP images are supported."
-            )
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image type.",
+        )
 
-    # Read upload in chunks (protect memory)
-    logger.info("Reading uploaded file...")
-    image = await read_upload_bytes(file, MAX_FILE_SIZE)
-    logger.info("Upload size: %d bytes", len(image))
+    image = await read_upload(file)
 
-    if not image:
-        raise HTTPException(status_code=400, detail="Empty image.")
+    logger.info(
+        "Upload size=%d bytes",
+        len(image),
+    )
 
-    # Preprocess (resize/convert) with robust error handling
-    try:
-        logger.info("Preprocessing image %s...", filename)
-        normalized = preprocess_image(image)
-        logger.info("Preprocessed size: %d bytes", len(normalized))
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Image preprocessing failed for %s", filename)
-        raise HTTPException(status_code=400, detail="Unable to process image.")
+    preprocess_start = time.perf_counter()
 
-    start = starttime.perf_counter()
+    normalized = preprocess_image(image)
 
-    # Limit concurrency with semaphore
+    logger.info(
+        "Preprocessing completed in %.2fs",
+        time.perf_counter() - preprocess_start,
+    )
+
+    logger.info(
+        "Processed size=%d bytes",
+        len(normalized),
+    )
+
     async with semaphore:
-        # First attempt using existing session
+
+        # --------------------------------------------------
+        # First attempt
+        # --------------------------------------------------
+
         try:
-            logger.info("Acquiring ONNX session for %s...", filename)
+
             current_session = await get_session()
 
-            logger.info("Calling rembg.remove for %s (first attempt)", filename)
-            output = await run_in_threadpool(remove, normalized, session=current_session)
+            logger.info("Calling rembg.remove()")
 
-            logger.info("Background removal completed in %.2fs", starttime.perf_counter() - start)
-            # Ensure memory is freed promptly
-            gc.collect()
+            inference_start = time.perf_counter()
 
-            # If rembg returned bytes, ensure we return PNG bytes and proper media type from the route
+            output = await run_in_threadpool(
+                remove,
+                normalized,
+                session=current_session,
+            )
+
+            logger.info(
+                "Inference completed in %.2fs",
+                time.perf_counter() - inference_start,
+            )
+
+            if not output:
+                raise RuntimeError(
+                    "rembg returned empty output"
+                )
+
+            if not isinstance(output, bytes):
+                raise RuntimeError(
+                    f"Expected bytes but got {type(output)}"
+                )
+
             return output
 
-        except Exception as exc:
-            # log full exception and attempt to recover
-            logger.exception("Background removal failed on first attempt for %s: %s", filename, exc)
+        except Exception:
 
-        # Retry with recreated session
+            logger.exception(
+                "First attempt failed."
+            )
+
+        # --------------------------------------------------
+        # Retry
+        # --------------------------------------------------
+
         try:
-            logger.warning("Recreating ONNX session and retrying for %s", filename)
-            await recreate_session()
-            logger.info("Calling rembg.remove for %s (retry)", filename)
-            output = await run_in_threadpool(remove, normalized, session=session)
 
-            logger.info("Retry succeeded in %.2fs", starttime.perf_counter() - start)
-            gc.collect()
+            await recreate_session()
+
+            logger.info(
+                "Retrying with fresh session..."
+            )
+
+            inference_start = time.perf_counter()
+
+            output = await run_in_threadpool(
+                remove,
+                normalized,
+                session=session,
+            )
+
+            logger.info(
+                "Retry completed in %.2fs",
+                time.perf_counter() - inference_start,
+            )
+
+            if not output:
+                raise RuntimeError(
+                    "rembg returned empty output"
+                )
+
+            if not isinstance(output, bytes):
+                raise RuntimeError(
+                    f"Expected bytes but got {type(output)}"
+                )
+
             return output
 
-        except Exception as exc:
-            logger.exception("Retry also failed for %s: %s", filename, exc)
-            # Final failure for this request
+        except Exception:
+
+            logger.exception(
+                "Retry failed."
+            )
+
             raise HTTPException(
                 status_code=500,
-                detail="Background removal failed due to an internal error."
+                detail="Background removal failed.",
+            )
+
+        finally:
+
+            gc.collect()
+
+            logger.info(
+                "Request finished in %.2fs",
+                time.perf_counter() - started,
             )
