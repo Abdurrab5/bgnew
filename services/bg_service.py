@@ -24,20 +24,21 @@ def positive_int(value: Optional[str], default: int) -> int:
     except Exception:
         return default
 
-
 MAX_CONCURRENT = positive_int(
     os.getenv("MAX_CONCURRENT"),
     1,
 )
 
+# Maximum upload size: 3 MB
 MAX_FILE_SIZE = positive_int(
     os.getenv("MAX_FILE_SIZE"),
-    5 * 1024 * 1024,
+    3 * 1024 * 1024,
 )
 
+# Resize images before inference
 MAX_DIMENSION = positive_int(
     os.getenv("MAX_DIMENSION"),
-    1024,
+    512,
 )
 
 ALLOWED_TYPES = {
