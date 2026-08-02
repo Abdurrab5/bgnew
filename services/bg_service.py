@@ -24,18 +24,17 @@ def positive_int(value: Optional[str], default: int) -> int:
     except Exception:
         return default
 
+
 MAX_CONCURRENT = positive_int(
     os.getenv("MAX_CONCURRENT"),
     1,
 )
 
-# Maximum upload size: 3 MB
 MAX_FILE_SIZE = positive_int(
     os.getenv("MAX_FILE_SIZE"),
     3 * 1024 * 1024,
 )
 
-# Resize images before inference
 MAX_DIMENSION = positive_int(
     os.getenv("MAX_DIMENSION"),
     512,
@@ -73,7 +72,6 @@ async def get_session():
 
     if session is None:
         async with session_lock:
-
             if session is None:
                 logger.info("Loading U2Net model...")
 
@@ -91,7 +89,6 @@ async def recreate_session():
     global session
 
     async with session_lock:
-
         logger.warning("Recreating ONNX session...")
 
         session = await run_in_threadpool(
@@ -107,12 +104,10 @@ async def recreate_session():
 
 
 def preprocess_image(image_bytes: bytes) -> bytes:
-
     try:
         img = Image.open(io.BytesIO(image_bytes))
 
     except UnidentifiedImageError:
-
         raise HTTPException(
             status_code=400,
             detail="Invalid image.",
@@ -150,11 +145,9 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 
 
 async def read_upload(file: UploadFile) -> bytes:
-
     buffer = io.BytesIO()
 
     while True:
-
         chunk = await file.read(65536)
 
         if not chunk:
@@ -186,9 +179,6 @@ async def remove_bg(file: UploadFile) -> bytes:
     )
 
     try:
-        # --------------------------------------------------
-        # Validate content type
-        # --------------------------------------------------
 
         if file.content_type not in ALLOWED_TYPES:
             raise HTTPException(
@@ -196,20 +186,12 @@ async def remove_bg(file: UploadFile) -> bytes:
                 detail="Unsupported image type.",
             )
 
-        # --------------------------------------------------
-        # Read upload
-        # --------------------------------------------------
-
         image = await read_upload(file)
 
         logger.info(
             "Upload size: %d bytes",
             len(image),
         )
-
-        # --------------------------------------------------
-        # Preprocess
-        # --------------------------------------------------
 
         preprocess_started = time.perf_counter()
 
@@ -225,24 +207,26 @@ async def remove_bg(file: UploadFile) -> bytes:
             len(normalized),
         )
 
-        # --------------------------------------------------
-        # Run inference
-        # --------------------------------------------------
-
         async with semaphore:
+
+            current_session = await get_session()
 
             for attempt in (1, 2):
 
                 try:
 
-                    if attempt == 1:
-                        current_session = await get_session()
-                    else:
+                    if attempt == 2:
                         logger.warning(
-                            "Retrying with a fresh ONNX session..."
+                            "Retrying with fresh ONNX session..."
                         )
+
                         await recreate_session()
                         current_session = session
+
+                    logger.info(
+                        "==== BEFORE remove() attempt=%d ====",
+                        attempt,
+                    )
 
                     inference_started = time.perf_counter()
 
@@ -253,9 +237,13 @@ async def remove_bg(file: UploadFile) -> bytes:
                     )
 
                     logger.info(
-                        "Inference completed in %.2fs (attempt %d)",
-                        time.perf_counter() - inference_started,
+                        "==== AFTER remove() attempt=%d ====",
                         attempt,
+                    )
+
+                    logger.info(
+                        "Inference completed in %.2fs",
+                        time.perf_counter() - inference_started,
                     )
 
                     if not output:
@@ -280,7 +268,7 @@ async def remove_bg(file: UploadFile) -> bytes:
                 except Exception:
 
                     logger.exception(
-                        "Attempt %d failed.",
+                        "Inference attempt %d failed.",
                         attempt,
                     )
 
@@ -298,106 +286,3 @@ async def remove_bg(file: UploadFile) -> bytes:
             "Request finished in %.2fs",
             time.perf_counter() - started,
         )
-    async with semaphore:
-
-        # --------------------------------------------------
-        # First attempt
-        # --------------------------------------------------
-
-        try:
-
-            current_session = await get_session()
-
-            logger.info("Calling rembg.remove()")
-
-            inference_start = time.perf_counter()
-
-            output = await run_in_threadpool(
-                remove,
-                normalized,
-                session=current_session,
-            )
-
-            logger.info(
-                "Inference completed in %.2fs",
-                time.perf_counter() - inference_start,
-            )
-
-            if not output:
-                raise RuntimeError(
-                    "rembg returned empty output"
-                )
-
-            if not isinstance(output, bytes):
-                raise RuntimeError(
-                    f"Expected bytes but got {type(output)}"
-                )
-
-            return output
-
-        except Exception:
-
-            logger.exception(
-                "First attempt failed."
-            )
-
-        # --------------------------------------------------
-        # Retry
-        # --------------------------------------------------
-
-        try:
-
-            await recreate_session()
-
-            logger.info(
-                "Retrying with fresh session..."
-            )
-
-            inference_start = time.perf_counter()
-
-            logger.info("Starting rembg inference")
-
-            output = await run_in_threadpool(
-            remove,
-            normalized,
-            session=current_session,
-            )
-
-            logger.info("Finished rembg inference")
-
-            logger.info(
-                "Retry completed in %.2fs",
-                time.perf_counter() - inference_start,
-            )
-
-            if not output:
-                raise RuntimeError(
-                    "rembg returned empty output"
-                )
-
-            if not isinstance(output, bytes):
-                raise RuntimeError(
-                    f"Expected bytes but got {type(output)}"
-                )
-
-            return output
-
-        except Exception:
-
-            logger.exception(
-                "Retry failed."
-            )
-
-            raise HTTPException(
-                status_code=500,
-                detail="Background removal failed.",
-            )
-
-        finally:
-
-            gc.collect()
-
-            logger.info(
-                "Request finished in %.2fs",
-                time.perf_counter() - started,
-            )
