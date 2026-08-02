@@ -355,11 +355,15 @@ async def remove_bg(file: UploadFile) -> bytes:
 
             inference_start = time.perf_counter()
 
+            logger.info("Starting rembg inference")
+
             output = await run_in_threadpool(
-                remove,
-                normalized,
-                session=session,
+            remove,
+            normalized,
+            session=current_session,
             )
+
+            logger.info("Finished rembg inference")
 
             logger.info(
                 "Retry completed in %.2fs",
