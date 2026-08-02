@@ -181,7 +181,7 @@ async def remove_bg(file: UploadFile):
         logger.exception("Image preprocessing failed for %s", filename)
         raise HTTPException(status_code=400, detail="Unable to process image.")
 
-    start = time.perf_counter()
+    start = starttime.perf_counter()
 
     # Limit concurrency with semaphore
     async with semaphore:
@@ -193,7 +193,7 @@ async def remove_bg(file: UploadFile):
             logger.info("Calling rembg.remove for %s (first attempt)", filename)
             output = await run_in_threadpool(remove, normalized, session=current_session)
 
-            logger.info("Background removal completed in %.2fs", time.perf_counter() - start)
+            logger.info("Background removal completed in %.2fs", starttime.perf_counter() - start)
             # Ensure memory is freed promptly
             gc.collect()
 
@@ -211,7 +211,7 @@ async def remove_bg(file: UploadFile):
             logger.info("Calling rembg.remove for %s (retry)", filename)
             output = await run_in_threadpool(remove, normalized, session=session)
 
-            logger.info("Retry succeeded in %.2fs", time.perf_counter() - start)
+            logger.info("Retry succeeded in %.2fs", starttime.perf_counter() - start)
             gc.collect()
             return output
 
