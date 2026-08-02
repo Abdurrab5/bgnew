@@ -37,7 +37,7 @@ MAX_FILE_SIZE = positive_int(
 
 MAX_DIMENSION = positive_int(
     os.getenv("MAX_DIMENSION"),
-    512,
+    256,
 )
 
 ALLOWED_TYPES = {
