@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from typing import Optional
-
+import resource
 from fastapi import HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -229,7 +229,10 @@ async def remove_bg(file: UploadFile) -> bytes:
                     )
 
                     inference_started = time.perf_counter()
+                   
 
+                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    logger.info("Memory before inference: %d KB", rss)
                     output = await run_in_threadpool(
                         remove,
                         normalized,
