@@ -174,45 +174,129 @@ async def read_upload(file: UploadFile) -> bytes:
 # ==========================================================
 
 
-async def remove_bg(file: UploadFile):
-
+async def remove_bg(file: UploadFile) -> bytes:
     started = time.perf_counter()
-
     filename = file.filename or "unknown"
 
     logger.info(
-        "Request started filename=%s type=%s",
+        "Request started | filename=%s | content_type=%s",
         filename,
         file.content_type,
     )
 
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported image type.",
+    try:
+        # --------------------------------------------------
+        # Validate content type
+        # --------------------------------------------------
+
+        if file.content_type not in ALLOWED_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported image type.",
+            )
+
+        # --------------------------------------------------
+        # Read upload
+        # --------------------------------------------------
+
+        image = await read_upload(file)
+
+        logger.info(
+            "Upload size: %d bytes",
+            len(image),
         )
 
-    image = await read_upload(file)
+        # --------------------------------------------------
+        # Preprocess
+        # --------------------------------------------------
 
-    logger.info(
-        "Upload size=%d bytes",
-        len(image),
-    )
+        preprocess_started = time.perf_counter()
 
-    preprocess_start = time.perf_counter()
+        normalized = preprocess_image(image)
 
-    normalized = preprocess_image(image)
+        logger.info(
+            "Preprocessing completed in %.2fs",
+            time.perf_counter() - preprocess_started,
+        )
 
-    logger.info(
-        "Preprocessing completed in %.2fs",
-        time.perf_counter() - preprocess_start,
-    )
+        logger.info(
+            "Processed image size: %d bytes",
+            len(normalized),
+        )
 
-    logger.info(
-        "Processed size=%d bytes",
-        len(normalized),
-    )
+        # --------------------------------------------------
+        # Run inference
+        # --------------------------------------------------
 
+        async with semaphore:
+
+            for attempt in (1, 2):
+
+                try:
+
+                    if attempt == 1:
+                        current_session = await get_session()
+                    else:
+                        logger.warning(
+                            "Retrying with a fresh ONNX session..."
+                        )
+                        await recreate_session()
+                        current_session = session
+
+                    inference_started = time.perf_counter()
+
+                    output = await run_in_threadpool(
+                        remove,
+                        normalized,
+                        session=current_session,
+                    )
+
+                    logger.info(
+                        "Inference completed in %.2fs (attempt %d)",
+                        time.perf_counter() - inference_started,
+                        attempt,
+                    )
+
+                    if not output:
+                        raise RuntimeError(
+                            "rembg returned empty output."
+                        )
+
+                    if not isinstance(output, bytes):
+                        raise RuntimeError(
+                            f"Expected bytes but got {type(output)}"
+                        )
+
+                    logger.info(
+                        "Background removal succeeded."
+                    )
+
+                    return output
+
+                except HTTPException:
+                    raise
+
+                except Exception:
+
+                    logger.exception(
+                        "Attempt %d failed.",
+                        attempt,
+                    )
+
+                    if attempt == 2:
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Background removal failed.",
+                        )
+
+    finally:
+
+        gc.collect()
+
+        logger.info(
+            "Request finished in %.2fs",
+            time.perf_counter() - started,
+        )
     async with semaphore:
 
         # --------------------------------------------------
