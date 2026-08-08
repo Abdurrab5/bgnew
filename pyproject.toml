@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bgnew"
+version = "1.0.0"
+description = "Background removal API for FastAPI Cloud"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi==0.128.8",
+    "uvicorn==0.39.0",
+    "python-multipart==0.0.20",
+    "Pillow==11.3.0",
+    "rembg==2.0.61",
+    "onnxruntime==1.19.2",
+]
+
+[tool.fastapi]
+entrypoint = "main:app"
