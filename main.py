@@ -1,110 +1,97 @@
-import logging
+
 import os
+import time
+import logging
 
-# ==========================================================
-# Environment
-# ==========================================================
+from fastapi import FastAPI
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+from routes.bg_remove import router
 
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.environ.setdefault("U2NET_HOME", MODELS_DIR)
+
+# =========================================================
+# CPU / THREAD LIMITS
+# =========================================================
+
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
-from routes.bg_remove import router
-from services.bg_service import initialize_session
-
-# ==========================================================
-# Logging
-# ==========================================================
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
-# ==========================================================
-# FastAPI
-# ==========================================================
+
+# =========================================================
+# PROCESS INFORMATION
+# =========================================================
+
+PROCESS_START = time.time()
+PROCESS_ID = os.getpid()
+
+
+# =========================================================
+# FASTAPI
+# =========================================================
 
 app = FastAPI(
-    title="Background Removal API",
-    description="High-performance background removal service powered by rembg and U²Net.",
-    version="1.0.0",
-    debug=False,
+    title="BG Remove API",
+    version="1.1",
 )
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting BG Remove API...")
-    logger.info("U2NET_HOME=%s", os.environ.get("U2NET_HOME"))
-    await initialize_session()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("BG Remove API stopped.")
-
-# ==========================================================
-# Middleware
-# ==========================================================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ==========================================================
-# Routes
-# ==========================================================
 
 app.include_router(router)
 
-# ==========================================================
-# Health
-# ==========================================================
+
+# =========================================================
+# STARTUP
+# =========================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    logger.info("=" * 60)
+    logger.info("BG REMOVE API STARTED")
+    logger.info("PID: %s", PROCESS_ID)
+    logger.info("Python PID process initialized")
+    logger.info("=" * 60)
 
 
-@app.get("/", tags=["System"])
+# =========================================================
+# ROOT
+# =========================================================
+
+@app.get("/")
 async def root():
+
     return {
-        "status": "running",
-        "service": "Background Removal API",
-        "version": "1.0.0",
+        "status": "BG API running",
+        "pid": os.getpid(),
     }
 
 
-@app.get("/health", tags=["System"])
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get("/health")
 async def health():
+
+    uptime = time.time() - PROCESS_START
+
     return {
         "status": "healthy",
+        "pid": os.getpid(),
+        "uptime_seconds": round(uptime, 2),
     }
-
-# ==========================================================
-# Local Development
-# ==========================================================
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        log_level="info",
-        access_log=True,
-        reload=False,
-    )
