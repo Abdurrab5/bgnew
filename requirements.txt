@@ -1,4 +1,6 @@
 fastapi[standard]
+fastapi-cli==0.0.27
+fastapi-cloud-cli==0.20.0
 uvicorn
 python-multipart
 Pillow
