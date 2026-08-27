@@ -88,7 +88,7 @@ def log_memory(label: str, request_id: str = "-"):
     except Exception:
 
         logger.exception(
-            "[%s] Failed to read process memory.",
+            "[%s] Failed to read process memory fastapicloud .",
             request_id,
         )
 
