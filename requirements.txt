@@ -1,9 +1,9 @@
 fastapi[standard]
 fastapi-cli==0.0.27
 fastapi-cloud-cli==0.20.0
-uvicorn
+uvicorn==0.49.0
 python-multipart
 Pillow
-rembg
+rembg==2.0.76
 onnxruntime
 psutil
