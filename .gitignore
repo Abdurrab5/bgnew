@@ -58,6 +58,10 @@ tmp/
 # Local env files
 .env
 .env.*
+!.env.example
 
 # Ignore the project models dir only if you prefer (comment out if you want to keep it in repo)
 # models/
+
+# Downloaded rembg/ONNX model artifacts
+*.onnx

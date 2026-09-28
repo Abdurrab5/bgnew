@@ -1,644 +1,176 @@
 from __future__ import annotations
 
-import gc
+import asyncio
 import io
 import logging
-import os
+import threading
 import time
 import uuid
-from typing import Final
+import warnings
 
-import psutil
 from fastapi import HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageOps, UnidentifiedImageError
 from rembg import new_session, remove
 
+from config import settings
 
 logger = logging.getLogger(__name__)
+_session = None
+_session_lock = threading.Lock()
+_inference_slots = asyncio.Semaphore(settings.max_concurrent_jobs)
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-MODEL_NAME: Final[str] = os.getenv(
-    "BG_MODEL",
-    "u2netp",
-)
-
-MAX_FILE_SIZE: Final[int] = int(
-    os.getenv(
-        "BG_MAX_FILE_SIZE",
-        str(10 * 1024 * 1024),
-    )
-)
-
-MAX_IMAGE_PIXELS: Final[int] = int(
-    os.getenv(
-        "BG_MAX_IMAGE_PIXELS",
-        str(25_000_000),
-    )
-)
-
-MAX_INFERENCE_DIMENSION: Final[int] = int(
-    os.getenv(
-        "BG_MAX_INFERENCE_DIMENSION",
-        "2048",
-    )
-)
-
-MAX_CONCURRENT_INFERENCE: Final[int] = int(
-    os.getenv(
-        "BG_MAX_CONCURRENT",
-        "1",
-    )
-)
-
-ALLOWED_CONTENT_TYPES: Final[set[str]] = {
-    "image/png",
-    "image/jpeg",
-    "image/webp",
+_MIME_FORMATS = {
+    "image/png": "PNG",
+    "image/jpeg": "JPEG",
+    "image/webp": "WEBP",
 }
 
 
-# ============================================================
-# PROCESS
-# ============================================================
-
-_process = psutil.Process(os.getpid())
+def model_ready() -> bool:
+    return _session is not None
 
 
-# ============================================================
-# MODEL STATE
-# ============================================================
-
-_session = None
-
-_session_lock = None
-
-_inference_semaphore = None
-
-
-# ============================================================
-# LAZY ASYNC PRIMITIVES
-# ============================================================
-
-def _get_session_lock():
-    global _session_lock
-
-    if _session_lock is None:
-        import asyncio
-
-        _session_lock = asyncio.Lock()
-
-    return _session_lock
-
-
-def _get_inference_semaphore():
-    global _inference_semaphore
-
-    if _inference_semaphore is None:
-        import asyncio
-
-        _inference_semaphore = asyncio.Semaphore(
-            MAX_CONCURRENT_INFERENCE
-        )
-
-    return _inference_semaphore
-
-
-# ============================================================
-# MEMORY
-# ============================================================
-
-def log_memory(
-    label: str,
-    request_id: str,
-) -> None:
-
-    try:
-
-        memory = _process.memory_info()
-
-        rss_mb = (
-            memory.rss /
-            1024 /
-            1024
-        )
-
-        logger.info(
-            "[%s] MEMORY | %s | RSS=%.2f MB",
-            request_id,
-            label,
-            rss_mb,
-        )
-
-    except Exception:
-
-        logger.debug(
-            "[%s] Memory information unavailable.",
-            request_id,
-            exc_info=True,
-        )
-
-
-# ============================================================
-# MODEL
-# ============================================================
-
-async def get_model_session():
-
+def _get_model_session():
+    """Initialize once per process; keep model loading off the event loop."""
     global _session
-
-    if _session is not None:
-        return _session
-
-    lock = _get_session_lock()
-
-    async with lock:
-
-        if _session is not None:
-            return _session
-
-        logger.info(
-            "Loading background-removal model: %s",
-            MODEL_NAME,
-        )
-
-        started = time.perf_counter()
-
-        try:
-
-            _session = await run_in_threadpool(
-                new_session,
-                MODEL_NAME,
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Failed to initialize model: %s",
-                MODEL_NAME,
-            )
-
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Background removal model "
-                    "is temporarily unavailable."
-                ),
-            )
-
-        elapsed = (
-            time.perf_counter() -
-            started
-        )
-
-        logger.info(
-            "Model loaded successfully | model=%s | time=%.2fs",
-            MODEL_NAME,
-            elapsed,
-        )
-
-        log_memory(
-            "AFTER MODEL LOAD",
-            "SYSTEM",
-        )
-
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                started = time.perf_counter()
+                logger.info("Initializing rembg model=%s", settings.model_name)
+                _session = new_session(
+                    settings.model_name,
+                    providers=["CPUExecutionProvider"],
+                )
+                logger.info(
+                    "Model initialized model=%s duration_seconds=%.2f",
+                    settings.model_name,
+                    time.perf_counter() - started,
+                )
     return _session
 
 
-# ============================================================
-# IMAGE VALIDATION
-# ============================================================
-
-def inspect_image(
-    image_bytes: bytes,
-    request_id: str,
-) -> tuple[int, int]:
-
-    try:
-
-        with Image.open(
-            io.BytesIO(image_bytes)
-        ) as image:
-
-            image.verify()
-
-        with Image.open(
-            io.BytesIO(image_bytes)
-        ) as image:
-
-            width = image.width
-            height = image.height
-
-            logger.info(
-                "[%s] IMAGE | width=%d | height=%d | format=%s | mode=%s",
-                request_id,
-                width,
-                height,
-                image.format,
-                image.mode,
-            )
-
-    except UnidentifiedImageError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is not a valid image.",
-        )
-
-    except Exception:
-
-        logger.exception(
-            "[%s] Image validation failed.",
-            request_id,
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Unable to read the uploaded image.",
-        )
-
-    pixels = width * height
-
-    if pixels > MAX_IMAGE_PIXELS:
-
+async def _read_limited(file: UploadFile) -> bytes:
+    # Read at most one byte beyond the limit, avoiding an unbounded in-memory read.
+    data = await file.read(settings.max_upload_bytes + 1)
+    if len(data) > settings.max_upload_bytes:
         raise HTTPException(
             status_code=413,
-            detail=(
-                "Image dimensions are too large. "
-                "Please upload a smaller image."
-            ),
+            detail=f"Maximum upload size is {settings.max_upload_bytes // (1024 * 1024)} MB.",
         )
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded image is empty.")
+    return data
 
-    return width, height
 
-
-# ============================================================
-# PREPROCESS
-# ============================================================
-
-def preprocess_image(
-    image_bytes: bytes,
-    request_id: str,
-) -> tuple[Image.Image, tuple[int, int]]:
+def _decode_and_prepare(data: bytes, declared_type: str | None) -> tuple[Image.Image, tuple[int, int]]:
+    if declared_type not in _MIME_FORMATS:
+        raise HTTPException(status_code=415, detail="Only PNG, JPEG and WebP images are supported.")
 
     try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as probe:
+                image_format = probe.format
+                width, height = probe.size
+                if width < 1 or height < 1 or width * height > settings.max_image_pixels:
+                    raise HTTPException(status_code=413, detail="Image dimensions exceed the allowed limit.")
+                probe.verify()
 
-        with Image.open(
-            io.BytesIO(image_bytes)
-        ) as original:
+            if image_format != _MIME_FORMATS[declared_type]:
+                raise HTTPException(status_code=415, detail="Image content does not match its declared format.")
 
-            image =
-                ImageOps.exif_transpose(
-                    original
-                )
-
-            original_size = (
-                image.width,
-                image.height,
-            )
-
-            # Work on a copy so the source image
-            # remains untouched.
-            image = image.copy()
-
-            # RGB is required by the rembg model.
-            if image.mode != "RGB":
-
-                image = image.convert(
-                    "RGB"
-                )
-
-            if (
-                image.width >
-                MAX_INFERENCE_DIMENSION
-                or
-                image.height >
-                MAX_INFERENCE_DIMENSION
-            ):
-
-                image.thumbnail(
-                    (
-                        MAX_INFERENCE_DIMENSION,
-                        MAX_INFERENCE_DIMENSION,
-                    ),
+            with Image.open(io.BytesIO(data)) as source:
+                source.load()
+                oriented = ImageOps.exif_transpose(source)
+                original_size = oriented.size
+                prepared = oriented.convert("RGB")
+                prepared.thumbnail(
+                    (settings.max_inference_dimension, settings.max_inference_dimension),
                     Image.Resampling.LANCZOS,
                 )
-
-            logger.info(
-                "[%s] PREPROCESS | original=%sx%s | inference=%sx%s",
-                request_id,
-                original_size[0],
-                original_size[1],
-                image.width,
-                image.height,
-            )
-
-            return image, original_size
-
-    except UnidentifiedImageError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image.",
-        )
-
+                return prepared, original_size
     except HTTPException:
-
         raise
-
-    except Exception:
-
-        logger.exception(
-            "[%s] Image preprocessing failed.",
-            request_id,
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Unable to process image.",
-        )
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(status_code=400, detail="The uploaded file is not a valid image.") from exc
+    except Exception as exc:
+        logger.warning("Image decoding failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail="Unable to read the uploaded image.") from exc
 
 
-# ============================================================
-# BACKGROUND REMOVAL
-# ============================================================
+def _infer_and_encode(image: Image.Image, original_size: tuple[int, int], session) -> bytes:
+    result = remove(image, session=session)
+    if isinstance(result, bytes):
+        result_image = Image.open(io.BytesIO(result))
+    elif isinstance(result, Image.Image):
+        result_image = result
+    else:
+        raise TypeError("rembg returned an unsupported image result")
 
-async def remove_background(
-    file: UploadFile,
-) -> bytes:
-
-    request_id = uuid.uuid4().hex[:10]
-
-    started = time.perf_counter()
-
-    logger.info(
-        "[%s] START | filename=%s | content_type=%s",
-        request_id,
-        file.filename,
-        file.content_type,
-    )
-
-    log_memory(
-        "BEFORE REQUEST",
-        request_id,
-    )
-
-    # --------------------------------------------------------
-    # MIME validation
-    # --------------------------------------------------------
-
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Only PNG, JPEG and WEBP "
-                "images are supported."
-            ),
-        )
-
-    # --------------------------------------------------------
-    # Read upload
-    # --------------------------------------------------------
-
+    rgba = None
     try:
-
-        image_bytes = await file.read()
-
+        rgba = result_image.convert("RGBA")
+        if rgba.size != original_size:
+            resized = rgba.resize(original_size, Image.Resampling.LANCZOS)
+            rgba.close()
+            rgba = resized
+        output = io.BytesIO()
+        rgba.save(output, format="PNG", optimize=False, compress_level=6)
+        return output.getvalue()
     finally:
+        if rgba is not None:
+            rgba.close()
+        result_image.close()
 
-        await file.close()
 
-    if not image_bytes:
+async def remove_background(file: UploadFile) -> bytes:
+    started = time.perf_counter()
+    request_id = uuid.uuid4().hex[:10]
+    image = None
+    acquired = False
+    try:
+        data = await _read_limited(file)
+        image, original_size = await run_in_threadpool(_decode_and_prepare, data, file.content_type)
+        del data
 
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded image is empty.",
-        )
-
-    upload_size = len(image_bytes)
-
-    logger.info(
-        "[%s] UPLOAD | size=%.2f MB",
-        request_id,
-        upload_size / 1024 / 1024,
-    )
-
-    if upload_size > MAX_FILE_SIZE:
-
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Maximum upload size is "
-                f"{MAX_FILE_SIZE // 1024 // 1024} MB."
-            ),
-        )
-
-    # --------------------------------------------------------
-    # Validate actual image
-    # --------------------------------------------------------
-
-    inspect_image(
-        image_bytes,
-        request_id,
-    )
-
-    # --------------------------------------------------------
-    # Preprocess
-    # --------------------------------------------------------
-
-    image, original_size = preprocess_image(
-        image_bytes,
-        request_id,
-    )
-
-    del image_bytes
-
-    # --------------------------------------------------------
-    # Model
-    # --------------------------------------------------------
-
-    semaphore = (
-        _get_inference_semaphore()
-    )
-
-    async with semaphore:
-
-        logger.info(
-            "[%s] INFERENCE SLOT ACQUIRED",
-            request_id,
-        )
-
-        log_memory(
-            "BEFORE INFERENCE",
-            request_id,
-        )
+        if _inference_slots.locked():
+            logger.info("Request rejected as capacity is full request_id=%s", request_id)
+            raise HTTPException(status_code=503, detail="Background removal is busy. Please retry shortly.")
+        await _inference_slots.acquire()
+        acquired = True
 
         try:
+            session = await run_in_threadpool(_get_model_session)
+        except Exception as exc:
+            logger.exception("Model initialization failed")
+            raise HTTPException(status_code=503, detail="Background removal is temporarily unavailable.") from exc
 
-            model_session =
-                await get_model_session()
-
-            inference_started =
-                time.perf_counter()
-
-            logger.info(
-                "[%s] INFERENCE START | model=%s",
-                request_id,
-                MODEL_NAME,
-            )
-
-            output = await run_in_threadpool(
-                remove,
-                image,
-                session=model_session,
-            )
-
-            inference_time = (
-                time.perf_counter()
-                -
-                inference_started
-            )
-
-            logger.info(
-                "[%s] INFERENCE SUCCESS | time=%.2fs | output=%.2f MB",
-                request_id,
-                inference_time,
-                len(output) / 1024 / 1024,
-            )
-
-            # ------------------------------------------------
-            # Restore output to original dimensions
-            # ------------------------------------------------
-
-            final_output = await run_in_threadpool(
-                resize_output,
-                output,
-                original_size,
-                request_id,
-            )
-
-            total_time = (
-                time.perf_counter()
-                -
-                started
-            )
-
-            logger.info(
-                "[%s] COMPLETE | total=%.2fs | final=%.2f MB",
-                request_id,
-                total_time,
-                len(final_output) / 1024 / 1024,
-            )
-
-            log_memory(
-                "AFTER COMPLETE",
-                request_id,
-            )
-
-            return final_output
-
-        except HTTPException:
-
-            raise
-
-        except Exception:
-
-            logger.exception(
-                "[%s] INFERENCE FAILED",
-                request_id,
-            )
-
-            log_memory(
-                "INFERENCE FAILURE",
-                request_id,
-            )
-
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Background removal failed "
-                    "during AI processing."
-                ),
-            )
-
-        finally:
-
-            try:
-                image.close()
-            except Exception:
-                pass
-
-            gc.collect()
-
-            logger.info(
-                "[%s] INFERENCE SLOT RELEASED",
-                request_id,
-            )
-
-
-# ============================================================
-# OUTPUT PROCESSING
-# ============================================================
-
-def resize_output(
-    output: bytes,
-    original_size: tuple[int, int],
-    request_id: str,
-) -> bytes:
-
-    try:
-
-        with Image.open(
-            io.BytesIO(output)
-        ) as result:
-
-            result = result.convert(
-                "RGBA"
-            )
-
-            if result.size != original_size:
-
-                logger.info(
-                    "[%s] OUTPUT RESIZE | %sx%s -> %sx%s",
-                    request_id,
-                    result.width,
-                    result.height,
-                    original_size[0],
-                    original_size[1],
-                )
-
-                result = result.resize(
-                    original_size,
-                    Image.Resampling.LANCZOS,
-                )
-
-            buffer = io.BytesIO()
-
-            result.save(
-                buffer,
-                format="PNG",
-                optimize=False,
-                compress_level=6,
-            )
-
-            return buffer.getvalue()
-
-    except Exception:
-
-        logger.exception(
-            "[%s] Failed to finalize output.",
-            request_id,
+        inference_started = time.perf_counter()
+        result = await run_in_threadpool(_infer_and_encode, image, original_size, session)
+        logger.info(
+            "Image processed model=%s inference_seconds=%.2f total_seconds=%.2f output_bytes=%d",
+            settings.model_name,
+            time.perf_counter() - inference_started,
+            time.perf_counter() - started,
+            len(result),
         )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to create the "
-                "transparent output image."
-            ),
+        return result
+    except HTTPException as exc:
+        logger.info("Request rejected request_id=%s status=%d", request_id, exc.status_code)
+        raise
+    except Exception as exc:
+        logger.exception("Background removal failed request_id=%s", request_id)
+        raise HTTPException(status_code=500, detail="Background removal failed during image processing.") from exc
+    finally:
+        await file.close()
+        if image is not None:
+            image.close()
+        if acquired:
+            _inference_slots.release()
+        logger.info(
+            "Request finished request_id=%s total_seconds=%.2f",
+            request_id,
+            time.perf_counter() - started,
         )
