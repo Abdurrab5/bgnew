@@ -6,6 +6,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+import numpy as np
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -21,15 +22,24 @@ def image_bytes(image_format: str) -> bytes:
     return stream.getvalue()
 
 
-def fake_rembg(image, session):
-    return Image.new("RGBA", image.size, (30, 60, 90, 128))
+class FakeSession:
+    def get_inputs(self):
+        return [type("Node", (), {"name": "input"})()]
+
+    def get_outputs(self):
+        return [type("Node", (), {"name": "output"})()]
+
+    def run(self, output_names, feeds):
+        tensor = feeds["input"]
+        assert tensor.shape == (1, 3, 320, 320)
+        mask = np.linspace(0, 1, 320 * 320, dtype=np.float32).reshape(1, 1, 320, 320)
+        return [mask]
 
 
 class BackgroundRemovalAPITests(unittest.TestCase):
     def setUp(self):
         self.patches = [
-            patch.object(bg_service, "_get_model_session", return_value=object()),
-            patch.object(bg_service, "remove", side_effect=fake_rembg),
+            patch.object(bg_service, "_get_model_session", return_value=FakeSession()),
         ]
         for item in self.patches:
             item.start()
@@ -45,7 +55,10 @@ class BackgroundRemovalAPITests(unittest.TestCase):
         with Image.open(io.BytesIO(response.content)) as image:
             self.assertEqual(image.format, "PNG")
             self.assertEqual(image.mode, "RGBA")
-            self.assertEqual(image.getpixel((0, 0))[3], 128)
+            self.assertEqual(image.size, (3, 2))
+            alpha = np.asarray(image.getchannel("A"))
+            self.assertLess(int(alpha.min()), 255)
+            self.assertGreater(int(alpha.max()), 0)
 
     def upload(self, content, content_type):
         return self.client.post(
@@ -100,8 +113,10 @@ class BackgroundRemovalAPITests(unittest.TestCase):
             self.assertEqual(self.upload(image_bytes("PNG"), "image/png").status_code, 413)
 
     def test_inference_failure_returns_safe_non_200(self):
-        with patch.object(bg_service, "remove", side_effect=RuntimeError("private internals")):
-            response = self.upload(image_bytes("PNG"), "image/png")
+        session = FakeSession()
+        with patch.object(session, "run", side_effect=RuntimeError("private internals")):
+            with patch.object(bg_service, "_get_model_session", return_value=session):
+                response = self.upload(image_bytes("PNG"), "image/png")
         self.assertEqual(response.status_code, 500)
         self.assertEqual(
             response.json(),
@@ -122,11 +137,11 @@ class BackgroundRemovalAPITests(unittest.TestCase):
         inference_started = threading.Event()
         release_inference = threading.Event()
 
-        def slow_rembg(*_args, **_kwargs):
+        def slow_run(*_args, **_kwargs):
             inference_started.set()
             if not release_inference.wait(timeout=5):
                 raise TimeoutError("test inference release timed out")
-            return fake_rembg(_args[0], _kwargs.get("session"))
+            return [np.linspace(0, 1, 320 * 320, dtype=np.float32).reshape(1, 1, 320, 320)]
 
         response_holder = []
 
@@ -140,12 +155,14 @@ class BackgroundRemovalAPITests(unittest.TestCase):
                 )
 
         worker = threading.Thread(target=first_request)
-        with patch.object(bg_service, "remove", side_effect=slow_rembg):
-            worker.start()
-            self.assertTrue(inference_started.wait(timeout=5))
-            second_response = self.upload(image_bytes("PNG"), "image/png")
-            release_inference.set()
-            worker.join(timeout=5)
+        session = FakeSession()
+        with patch.object(session, "run", side_effect=slow_run):
+            with patch.object(bg_service, "_get_model_session", return_value=session):
+                worker.start()
+                self.assertTrue(inference_started.wait(timeout=5))
+                second_response = self.upload(image_bytes("PNG"), "image/png")
+                release_inference.set()
+                worker.join(timeout=5)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(second_response.status_code, 503)

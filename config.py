@@ -24,7 +24,6 @@ class Settings:
     model_name: str
     max_upload_bytes: int
     max_image_pixels: int
-    max_inference_dimension: int
     max_concurrent_jobs: int
     log_level: str
 
@@ -42,7 +41,6 @@ settings = Settings(
     model_name=os.getenv("MODEL_NAME", os.getenv("BG_MODEL", "u2netp")),
     max_upload_bytes=_max_upload_bytes,
     max_image_pixels=_int_setting("MAX_IMAGE_PIXELS", 25_000_000, legacy="BG_MAX_IMAGE_PIXELS"),
-    max_inference_dimension=_int_setting("MAX_INFERENCE_DIMENSION", 2048, legacy="BG_MAX_INFERENCE_DIMENSION"),
     max_concurrent_jobs=_int_setting("MAX_CONCURRENT_JOBS", 1, legacy="BG_MAX_CONCURRENT"),
     log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
