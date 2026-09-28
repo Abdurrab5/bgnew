@@ -1,16 +1,8 @@
 from __future__ import annotations
 
-# Keep native numerical libraries conservative on small CPU instances. These
-# values must be set before importing ONNX Runtime through the router.
-import os
 
-for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ[_name] = "1"
-os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
-os.environ["OMP_DYNAMIC"] = "FALSE"
-
-
-def _rss_mb() -> float | None:
+def _read_proc_rss_mb() -> float | None:
+    """Read resident memory without importing any application dependencies."""
     try:
         with open("/proc/self/status", encoding="ascii") as status:
             for line in status:
@@ -21,41 +13,52 @@ def _rss_mb() -> float | None:
     return None
 
 
-_IMPORT_START_RSS_MB = _rss_mb()
+_BARE_START_RSS_MB = _read_proc_rss_mb()
 
+# Import only the standard library before recording the first two boundaries.
 import logging
+import os
+import sys
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-
-from config import settings
-from middleware import UploadBodyLimitMiddleware
-from routes.bg_remove import router
-from services.bg_service import model_ready
-
 logging.basicConfig(
-    level=getattr(logging, settings.log_level, logging.INFO),
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("xhunta.background_remover")
+
+
+def _log_mem_stage(stage: str, rss_mb: float | None = None) -> None:
+    value = _read_proc_rss_mb() if rss_mb is None else rss_mb
+    logger.info(
+        "MEM_STAGE stage=%s rss_mb=%s pid=%s",
+        stage,
+        f"{value:.1f}" if value is not None else "unavailable",
+        os.getpid(),
+    )
+
+
+_log_mem_stage("bare_python_start", _BARE_START_RSS_MB)
+_log_mem_stage("stdlib_imported")
+
+# Set numerical-library thread counts before importing ONNX Runtime or NumPy.
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_name] = "1"
+os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+os.environ["OMP_DYNAMIC"] = "FALSE"
+
+from fastapi import FastAPI
+
+_log_mem_stage("fastapi_imported")
+
 PROCESS_START = time.monotonic()
-_IMPORT_COMPLETE_RSS_MB = _rss_mb()
-logger.info(
-    "BG_REMOVE stage=process_import_complete rss_mb=%s import_start_rss_mb=%s",
-    f"{_IMPORT_COMPLETE_RSS_MB:.1f}" if _IMPORT_COMPLETE_RSS_MB is not None else "unavailable",
-    f"{_IMPORT_START_RSS_MB:.1f}" if _IMPORT_START_RSS_MB is not None else "unavailable",
-)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    current_rss = _rss_mb()
-    logger.info(
-        "BG_REMOVE stage=application_startup rss_mb=%s model=%s",
-        f"{current_rss:.1f}" if current_rss is not None else "unavailable",
-        settings.model_name,
-    )
+    _log_mem_stage("application_startup")
+    logger.info("Starting Xhunta background remover model=%s", settings.model_name)
     yield
     logger.info("Stopping Xhunta background remover")
 
@@ -66,8 +69,80 @@ app = FastAPI(
     version="2.1.0",
     lifespan=lifespan,
 )
+_log_mem_stage("fastapi_app_created")
+
+from PIL import Image  # noqa: E402
+
+_log_mem_stage("pillow_imported")
+
+import numpy  # noqa: E402,F401
+
+_log_mem_stage("numpy_imported")
+
+import onnxruntime  # noqa: E402,F401
+
+_log_mem_stage("onnxruntime_imported")
+
+from routes.bg_remove import router  # noqa: E402
+
+_log_mem_stage("routes_imported")
+
+from services.bg_service import model_ready  # noqa: E402
+
+_log_mem_stage("services_bg_service_imported")
+
+from config import settings  # noqa: E402
+from middleware import UploadBodyLimitMiddleware  # noqa: E402
+
 app.include_router(router)
 app.add_middleware(UploadBodyLimitMiddleware)
+
+
+def _safe_worker_env() -> str:
+    names = ("WEB_CONCURRENCY", "UVICORN_WORKERS", "FASTAPI_WORKERS", "GUNICORN_WORKERS")
+    configured = [f"{name}={os.environ[name]}" for name in names if os.getenv(name, "").isdigit()]
+    return ",".join(configured) if configured else "unset"
+
+
+def _runtime_flags() -> tuple[str, str, str]:
+    """Report only safe process flags relevant to worker/reload topology."""
+    args = sys.argv[1:]
+    workers = "unspecified"
+    for index, arg in enumerate(args):
+        if arg in {"--workers", "-w"} and index + 1 < len(args) and args[index + 1].isdigit():
+            workers = args[index + 1]
+        elif arg.startswith("--workers=") and arg.partition("=")[2].isdigit():
+            workers = arg.partition("=")[2]
+    reload_mode = "enabled" if "--reload" in args or "--reload-dir" in args else "disabled"
+    preload = "enabled" if "--preload" in args or "--preload-app" in args else "disabled"
+    return workers, reload_mode, preload
+
+
+def _instrumentation_modules() -> str:
+    roots = ("ddtrace", "opentelemetry", "newrelic", "sentry_sdk", "elasticapm", "scout_apm")
+    loaded = [name for name in roots if name in sys.modules]
+    return ",".join(loaded) if loaded else "none-detected"
+
+
+_log_mem_stage("application_import_complete")
+_cli_workers, _reload_flag, _preload_flag = _runtime_flags()
+logger.info(
+    "MEM_STAGE stage=runtime_topology pid=%s ppid=%s cli_workers=%s worker_env=%s reload_flag=%s reload_env=%s preload_flag=%s instrumentation=%s",
+    os.getpid(),
+    os.getppid(),
+    _cli_workers,
+    _safe_worker_env(),
+    _reload_flag,
+    (
+        "unset"
+        if "UVICORN_RELOAD" not in os.environ
+        else "enabled"
+        if os.getenv("UVICORN_RELOAD", "").lower() in {"1", "true", "yes"}
+        else "disabled"
+    ),
+    _preload_flag,
+    _instrumentation_modules(),
+)
 
 
 @app.get("/")

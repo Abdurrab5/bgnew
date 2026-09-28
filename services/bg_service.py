@@ -68,7 +68,8 @@ def _log_stage(
         fields.append(f"original={original_size[0]}x{original_size[1]}")
     if stage in {"inference_prepared", "before_inference", "after_inference"}:
         fields.append(f"inference={_INFERENCE_SIZE[0]}x{_INFERENCE_SIZE[1]}")
-    logger.info("BG_REMOVE %s", " ".join(fields))
+    fields.append(f"pid={os.getpid()}")
+    logger.info("MEM_STAGE %s", " ".join(fields))
 
 
 def model_ready() -> bool:
@@ -152,9 +153,10 @@ def _get_model_session(request_id: str | None = None) -> ort.InferenceSession:
                 started = time.perf_counter()
                 rss = _rss_mb()
                 logger.info(
-                    "BG_REMOVE request_id=%s stage=before_model_init rss_mb=%s model=%s",
+                    "MEM_STAGE stage=before_model_init request_id=%s rss_mb=%s pid=%s model=%s",
                     request_id or "startup",
                     f"{rss:.1f}" if rss is not None else "unavailable",
+                    os.getpid(),
                     settings.model_name,
                 )
                 try:
@@ -185,17 +187,19 @@ def _get_model_session(request_id: str | None = None) -> ort.InferenceSession:
                     _session = candidate
                 except Exception:
                     logger.exception(
-                        "BG_REMOVE request_id=%s stage=model_init_failed duration_seconds=%.3f",
+                        "MEM_STAGE stage=model_init_failed request_id=%s duration_seconds=%.3f pid=%s",
                         request_id or "startup",
                         time.perf_counter() - started,
+                        os.getpid(),
                     )
                     raise
                 rss = _rss_mb()
                 logger.info(
-                    "BG_REMOVE request_id=%s stage=after_model_init rss_mb=%s duration_seconds=%.3f provider=%s",
+                    "MEM_STAGE stage=after_model_init request_id=%s rss_mb=%s duration_seconds=%.3f pid=%s provider=%s",
                     request_id or "startup",
                     f"{rss:.1f}" if rss is not None else "unavailable",
                     time.perf_counter() - started,
+                    os.getpid(),
                     ",".join(candidate.get_providers()),
                 )
     return _session
@@ -320,13 +324,14 @@ def _infer_and_encode(
         mask.close()
 
 
-async def remove_background(file: UploadFile) -> bytes:
+async def remove_background(file: UploadFile, request_id: str | None = None) -> bytes:
     started = time.perf_counter()
-    request_id = uuid.uuid4().hex[:10]
+    request_id = request_id or uuid.uuid4().hex[:10]
     image = None
     acquired = False
     original_size = None
     try:
+        _log_stage(request_id, "after_multipart_parse", started)
         data = await _read_limited(file)
         _log_stage(request_id, "upload_read", started)
         image, original_size = await run_in_threadpool(_decode_image, data, file.content_type)
