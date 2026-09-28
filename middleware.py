@@ -5,8 +5,7 @@ from starlette.responses import JSONResponse
 from config import settings
 
 _MULTIPART_OVERHEAD_BYTES = 64 * 1024
-
-
+# This is a rough estimate of the overhead that multipart/form-data adds to the request body.
 class UploadBodyLimitMiddleware:
     """Bound the multipart body before Starlette spools its uploaded file."""
 
