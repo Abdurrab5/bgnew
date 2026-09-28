@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 # Keep native numerical libraries conservative on small CPU instances. These
-# values must be set before importing rembg/ONNX Runtime through the router.
+# values must be set before importing ONNX Runtime through the router.
 import os
 
 for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ[_name] = "1"
 os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
 os.environ["OMP_DYNAMIC"] = "FALSE"
+
+
+def _rss_mb() -> float | None:
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+_IMPORT_START_RSS_MB = _rss_mb()
 
 import logging
 import time
@@ -26,11 +40,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xhunta.background_remover")
 PROCESS_START = time.monotonic()
+_IMPORT_COMPLETE_RSS_MB = _rss_mb()
+logger.info(
+    "BG_REMOVE stage=process_import_complete rss_mb=%s import_start_rss_mb=%s",
+    f"{_IMPORT_COMPLETE_RSS_MB:.1f}" if _IMPORT_COMPLETE_RSS_MB is not None else "unavailable",
+    f"{_IMPORT_START_RSS_MB:.1f}" if _IMPORT_START_RSS_MB is not None else "unavailable",
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    logger.info("Starting Xhunta background remover model=%s", settings.model_name)
+    current_rss = _rss_mb()
+    logger.info(
+        "BG_REMOVE stage=application_startup rss_mb=%s model=%s",
+        f"{current_rss:.1f}" if current_rss is not None else "unavailable",
+        settings.model_name,
+    )
     yield
     logger.info("Stopping Xhunta background remover")
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 def _int_setting(name: str, default: int, *, legacy: str | None = None) -> int:
@@ -22,6 +23,7 @@ def _int_setting(name: str, default: int, *, legacy: str | None = None) -> int:
 @dataclass(frozen=True)
 class Settings:
     model_name: str
+    model_cache_dir: Path
     max_upload_bytes: int
     max_image_pixels: int
     max_concurrent_jobs: int
@@ -39,6 +41,11 @@ else:
 
 settings = Settings(
     model_name=os.getenv("MODEL_NAME", os.getenv("BG_MODEL", "u2netp")),
+    model_cache_dir=Path(
+        os.getenv("MODEL_CACHE_DIR")
+        or os.getenv("U2NET_HOME")
+        or str(Path.home() / ".u2net")
+    ).expanduser(),
     max_upload_bytes=_max_upload_bytes,
     max_image_pixels=_int_setting("MAX_IMAGE_PIXELS", 25_000_000, legacy="BG_MAX_IMAGE_PIXELS"),
     max_concurrent_jobs=_int_setting("MAX_CONCURRENT_JOBS", 1, legacy="BG_MAX_CONCURRENT"),

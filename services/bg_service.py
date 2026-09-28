@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import io
 import logging
+import os
+import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 import warnings
 
@@ -13,7 +18,6 @@ import onnxruntime as ort
 from fastapi import HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageOps, UnidentifiedImageError
-from rembg.sessions.u2netp import U2netpSession
 
 from config import settings
 
@@ -30,6 +34,10 @@ _MIME_FORMATS = {
 _INFERENCE_SIZE = (320, 320)
 _MEAN = (0.485, 0.456, 0.406)
 _STD = (0.229, 0.224, 0.225)
+_MODEL_FILENAME = "u2netp.onnx"
+_MODEL_URL = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+_MODEL_SIZE_BYTES = 4_574_861
+_MODEL_MD5 = "8e83ca70e441ab06c318d82300c84806"
 
 
 def _rss_mb() -> float | None:
@@ -67,8 +75,76 @@ def model_ready() -> bool:
     return _session is not None
 
 
+def _model_md5(path) -> str:
+    digest = hashlib.md5(usedforsecurity=False)
+    with path.open("rb") as model_file:
+        for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_model_file(path) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError("u2netp model file is unavailable") from exc
+    if size != _MODEL_SIZE_BYTES:
+        raise RuntimeError("u2netp model file has an unexpected size")
+    if _model_md5(path) != _MODEL_MD5:
+        raise RuntimeError("u2netp model checksum verification failed")
+
+
+def _ensure_model_file():
+    """Verify the cached model or download its pinned official artifact atomically."""
+    cache_dir = settings.model_cache_dir
+    model_path = cache_dir / _MODEL_FILENAME
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / f"{_MODEL_FILENAME}.lock"
+
+    # The process session lock already prevents duplicate threads; flock also avoids
+    # parallel downloads if a host starts more than one worker against this cache.
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if model_path.exists():
+            _validate_model_file(model_path)
+            return model_path
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f"{_MODEL_FILENAME}.",
+            suffix=".download",
+            dir=cache_dir,
+        )
+        temporary_path = type(model_path)(temporary_name)
+        try:
+            digest = hashlib.md5(usedforsecurity=False)
+            downloaded = 0
+            with os.fdopen(descriptor, "wb") as target:
+                with urllib.request.urlopen(_MODEL_URL, timeout=60) as response:
+                    while chunk := response.read(1024 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > _MODEL_SIZE_BYTES:
+                            raise RuntimeError("u2netp download exceeded its expected size")
+                        digest.update(chunk)
+                        target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+
+            if downloaded != _MODEL_SIZE_BYTES:
+                raise RuntimeError("u2netp download has an unexpected size")
+            if digest.hexdigest() != _MODEL_MD5:
+                raise RuntimeError("u2netp download checksum verification failed")
+            os.replace(temporary_path, model_path)
+            _validate_model_file(model_path)
+            return model_path
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _get_model_session(request_id: str | None = None) -> ort.InferenceSession:
-    """Download through rembg/pooch once, then cache one constrained ORT session."""
+    """Download and verify once, then cache one constrained ORT session."""
     global _session
     if _session is None:
         with _session_lock:
@@ -84,7 +160,7 @@ def _get_model_session(request_id: str | None = None) -> ort.InferenceSession:
                 try:
                     if settings.model_name != "u2netp":
                         raise RuntimeError("Direct ONNX inference is configured for u2netp only")
-                    model_path = U2netpSession.download_models()
+                    model_path = _ensure_model_file()
                     options = ort.SessionOptions()
                     options.intra_op_num_threads = 1
                     options.inter_op_num_threads = 1
